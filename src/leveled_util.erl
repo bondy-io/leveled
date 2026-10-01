@@ -110,13 +110,15 @@ t2b(Term) ->
 %% @doc
 %% Write a file, sync it and rename it (and for super-safe mode read it back)
 %% An attempt to prevent crashes leaving files with empty or partially written
-%% values
+%% values.  The directory is synced after the rename, so the new name is on
+%% disk before any later deletion of the files it replaces can be.
 safe_rename(TempFN, RealFN, BinData, ReadCheck) ->
     {ok, TempFH} = file:open(TempFN, ?WRITE_OPS),
     ok = file:write(TempFH, BinData),
     ok = file:sync(TempFH),
     ok = file:close(TempFH),
     ok = file:rename(TempFN, RealFN),
+    ok = sync_dir(filename:dirname(RealFN)),
     case ReadCheck of
         true ->
             {ok, ReadBack} = file:read_file(RealFN),
@@ -124,6 +126,20 @@ safe_rename(TempFN, RealFN, BinData, ReadCheck) ->
             ok;
         false ->
             ok
+    end.
+
+-spec sync_dir(string()) -> ok.
+%% @doc
+%% Sync a directory, making the names created or renamed in it durable.
+%% Skipped on Windows, where OTP opens a directory read-only.
+sync_dir(Dir) ->
+    case os:type() of
+        {win32, _} ->
+            ok;
+        _ ->
+            {ok, DirFH} = file:open(Dir, [read, raw, directory]),
+            ok = file:sync(DirFH),
+            ok = file:close(DirFH)
     end.
 
 %%%============================================================================
@@ -160,6 +176,56 @@ safe_rename_test() ->
     RealFN1 = filename:join(?TEST_AREA, "test_manifest1.man"),
     ok = safe_rename(TempFN1, RealFN1, <<2:128/integer>>, true),
     ?assertMatch({ok, <<2:128/integer>>}, file:read_file(RealFN1)).
+
+safe_rename_syncs_dir_after_rename_test() ->
+    ok = filelib:ensure_dir(?TEST_AREA),
+    TempFN = filename:join(?TEST_AREA, "test_manifest2.pnd"),
+    RealFN = filename:join(?TEST_AREA, "test_manifest2.man"),
+    Dir = filename:dirname(RealFN),
+    Calls =
+        traced_calls(
+            [{file, rename, 2}, {file, open, 2}],
+            fun() ->
+                ok = safe_rename(TempFN, RealFN, <<3:128/integer>>, false)
+            end
+        ),
+    ?assertMatch(
+        [_, {file, rename, _}, {file, open, [Dir, [read, raw, directory]]}],
+        Calls
+    ).
+
+%% A process cannot be its own tracer, so the trace goes to a collector.
+traced_calls(MFAs, Fun) ->
+    Self = self(),
+    Collector =
+        spawn_link(
+            fun() ->
+                Loop =
+                    fun L(Acc) ->
+                        receive
+                            {trace, _, call, MFA} -> L([MFA | Acc]);
+                            dump -> Self ! {calls, lists:reverse(Acc)}
+                        end
+                    end,
+                Loop([])
+            end
+        ),
+    _ = [erlang:trace_pattern(MFA, true, [local]) || MFA <- MFAs],
+    _ = erlang:trace(Self, true, [call, {tracer, Collector}]),
+    try
+        Fun()
+    after
+        _ = erlang:trace(Self, false, [call]),
+        _ = [erlang:trace_pattern(MFA, false, [local]) || MFA <- MFAs]
+    end,
+    Ref = erlang:trace_delivered(Self),
+    receive
+        {trace_delivered, _, Ref} -> ok
+    end,
+    Collector ! dump,
+    receive
+        {calls, Calls} -> Calls
+    end.
 
 b2t_speed_test() ->
     %% This test is written as a demonstration of the binary_to_term
